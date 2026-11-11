@@ -5,7 +5,12 @@ from AI model outputs, plus quality assessment for frame selection.
 """
 
 from .closeup_detector import CloseupDetector
-from .frame_selector import FrameSelector, SelectionCriteria, create_frame_selector
+from .frame_selector import (
+    FrameSelector,
+    FrameSelectorConfig,
+    SelectionCriteria,
+    create_frame_selector,
+)
 from .head_angle_classifier import HeadAngleClassifier
 from .person_builder import PersonBuilder
 from .person_selector import PersonSelector
@@ -21,6 +26,7 @@ __all__ = [
     "create_quality_assessor",
     "CloseupDetector",
     "FrameSelector",
+    "FrameSelectorConfig",
     "create_frame_selector",
     "SelectionCriteria",
 ]

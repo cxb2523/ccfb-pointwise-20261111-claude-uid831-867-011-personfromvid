@@ -5,9 +5,12 @@ frames from each pose category and head angle category based on comprehensive
 quality metrics and diversity considerations.
 """
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
+
+import cv2
 
 from ..data.frame_data import FrameData
 from ..utils.logging import get_logger
@@ -24,6 +27,40 @@ class SelectionCriteria:
     quality_weight: float
     diversity_threshold: float
     temporal_diversity_threshold: float
+
+
+@dataclass
+class FrameSelectorConfig:
+    """Optional blur-filtering configuration for FrameSelector.
+
+    Blur filtering is fully opt-in: with the default ``blur_threshold`` of 0
+    not a single blur score is computed and selection behaves exactly as
+    before. When enabled, frames are normalized (short edge resized to
+    ``blur_resize_short_edge`` with INTER_AREA) before the Laplacian
+    variance is measured, so the threshold is comparable across mixed
+    resolutions (e.g. 4K and 720p). INTER_AREA averages out high-frequency
+    noise, so the score only preserves relative sharpness ordering across
+    resolutions — absolute values are resolution-dependent and should not
+    be treated as comparable to raw full-resolution Laplacian variances.
+    """
+
+    blur_threshold: float = 0.0  # 0 disables blur filtering entirely
+    blur_resize_short_edge: int = 512  # normalization target for blur scoring
+    blur_fallback_ratio: float = 0.3  # top fraction of window used on all-blur fallback
+
+    def __post_init__(self) -> None:
+        """Validate configuration values."""
+        if self.blur_threshold < 0:
+            raise ValueError("blur_threshold cannot be negative")
+        if self.blur_resize_short_edge <= 0:
+            raise ValueError("blur_resize_short_edge must be positive")
+        if not 0.0 < self.blur_fallback_ratio <= 1.0:
+            raise ValueError("blur_fallback_ratio must be in (0, 1]")
+
+    @property
+    def blur_filter_enabled(self) -> bool:
+        """Whether blur filtering is active (threshold above zero)."""
+        return self.blur_threshold > 0.0
 
 
 @dataclass
@@ -85,13 +122,20 @@ class FrameSelector:
     4. Provides detailed selection rationale and metadata
     """
 
-    def __init__(self, criteria: SelectionCriteria):
+    def __init__(
+        self,
+        criteria: SelectionCriteria,
+        config: Optional[FrameSelectorConfig] = None,
+    ):
         """Initialize frame selector with selection criteria.
 
         Args:
             criteria: Selection criteria (required)
+            config: Optional blur-filtering configuration. Defaults to a
+                disabled blur filter (zero overhead, legacy behavior).
         """
         self.criteria = criteria
+        self.config = config if config is not None else FrameSelectorConfig()
         self.logger = get_logger(f"{__name__}.FrameSelector")
 
         # Categories we're interested in
@@ -266,6 +310,117 @@ class FrameSelector:
             return frame.quality_metrics.overall_quality
 
         return sorted(frames, key=get_quality_score, reverse=True)
+
+    def _blur_cache_key(self) -> str:
+        """Cache key for blur scores in frame metadata.
+
+        The key embeds the normalization parameter (resize short edge) so
+        that changing the normalization size never reads stale scores.
+        """
+        return f"blur_score_s{self.config.blur_resize_short_edge}"
+
+    def _get_blur_score(self, frame: FrameData) -> float:
+        """Get the normalized blur (Laplacian variance) score for a frame.
+
+        Computed lazily on first use and cached in the frame's metadata
+        (``debug_info``), so re-running selection with a different threshold
+        reuses the scores. The frame is normalized on a grayscale copy —
+        short edge resized to ``blur_resize_short_edge`` with INTER_AREA —
+        without touching the original image.
+
+        Args:
+            frame: Frame to score
+
+        Returns:
+            Laplacian variance of the normalized grayscale image. Only
+            relative ordering is meaningful across resolutions.
+        """
+        cache_key = self._blur_cache_key()
+        cached = frame.debug_info.get(cache_key)
+        if cached is not None:
+            return cached
+
+        score = 0.0
+        image = frame.image
+        if image is not None and image.size > 0:
+            # Work on a grayscale copy; never modify the original image
+            if image.ndim == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image.copy()
+
+            # Normalize resolution: short edge to target size, fixed INTER_AREA
+            height, width = gray.shape[:2]
+            short_edge = min(height, width)
+            target = self.config.blur_resize_short_edge
+            if 0 < short_edge != target:
+                scale = target / short_edge
+                new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+                gray = cv2.resize(gray, new_size, interpolation=cv2.INTER_AREA)
+
+            score = float(cv2.Laplacian(gray, cv2.CV_64F).var())  # type: ignore
+        else:
+            self.logger.warning(
+                f"No image data for frame {frame.frame_id}; blur score defaults to 0"
+            )
+
+        frame.debug_info[cache_key] = score
+        return score
+
+    def _apply_blur_filter(
+        self, scored_frames: List[Tuple[FrameData, float]]
+    ) -> List[Tuple[FrameData, float]]:
+        """Filter a scored category window by the blur threshold.
+
+        Frames below ``blur_threshold`` are removed from the window. If the
+        whole window is blurry, the window is never left empty: the fallback
+        pool is the top ``blur_fallback_ratio`` of the window by original
+        composite score (at least 1 frame), and the frame with the highest
+        blur score wins, with ties broken by original composite score and
+        then timestamp. Filtering preserves the original score ordering.
+
+        Args:
+            scored_frames: (frame, score) tuples sorted by score descending
+
+        Returns:
+            Filtered (frame, score) tuples in the original sort order
+        """
+        if not self.config.blur_filter_enabled or not scored_frames:
+            return scored_frames
+
+        threshold = self.config.blur_threshold
+        kept = [
+            (frame, score)
+            for frame, score in scored_frames
+            if self._get_blur_score(frame) >= threshold
+        ]
+
+        if kept:
+            if len(kept) < len(scored_frames):
+                self.logger.debug(
+                    f"Blur filter removed {len(scored_frames) - len(kept)} "
+                    f"of {len(scored_frames)} frames below threshold {threshold}"
+                )
+            return kept
+
+        # Whole window is blurry: fall back so the window is never empty.
+        # Top fraction by original composite score, at least one frame
+        # (ceil so small windows still contribute a candidate).
+        fallback_count = max(1, math.ceil(len(scored_frames) * self.config.blur_fallback_ratio))
+        fallback_pool = scored_frames[:fallback_count]
+        best = min(
+            fallback_pool,
+            key=lambda item: (
+                -self._get_blur_score(item[0]),
+                -item[1],
+                item[0].source_info.video_timestamp,
+            ),
+        )
+        self.logger.debug(
+            f"All {len(scored_frames)} frames below blur threshold {threshold}; "
+            f"falling back to sharpest of top {fallback_count}: {best[0].frame_id}"
+        )
+        return [best]
 
     def _filter_usable_frames(
         self,
@@ -837,6 +992,9 @@ class FrameSelector:
                 candidate_frames, category_name, category_type, score_function
             )
 
+            # Step 1b: Blur filtering within the original window (no-op when disabled)
+            scored_frames = self._apply_blur_filter(scored_frames)
+
             # Step 2: Filter available candidates (priority claiming for poses only)
             if use_priority_claiming:
                 available_candidates = [
@@ -1007,13 +1165,16 @@ class FrameSelector:
         )
 
 
-def create_frame_selector(criteria: SelectionCriteria) -> FrameSelector:
+def create_frame_selector(
+    criteria: SelectionCriteria, config: Optional[FrameSelectorConfig] = None
+) -> FrameSelector:
     """Create a FrameSelector with the specified criteria.
 
     Args:
         criteria: Selection criteria
+        config: Optional blur-filtering configuration (disabled by default)
 
     Returns:
         Configured FrameSelector instance
     """
-    return FrameSelector(criteria)
+    return FrameSelector(criteria, config)
