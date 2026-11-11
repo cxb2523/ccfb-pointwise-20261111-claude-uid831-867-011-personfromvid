@@ -1,0 +1,10 @@
+{
+  "session_id": "4df9d178-ba9d-4a03-8dfa-22ffe9e9b287",
+  "model": "auto_model/urm",
+  "context_window": 1000000,
+  "max_output_tokens": 32000,
+  "stream_file": "artifacts/context_stream_4df9d178-ba9d-4a03-8dfa-22ffe9e9b287.jsonl",
+  "stream_sha256": "fb5373703c1a1f496e82000d6b6a6d2ff7c0fd535e4ec389d225fb2f549d3534",
+  "source_session": "4df9d178-ba9d-4a03-8dfa-22ffe9e9b287",
+  "verified_at": "2026-11-11 13:11:18"
+}
